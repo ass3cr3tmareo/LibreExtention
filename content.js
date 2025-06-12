@@ -6,12 +6,14 @@ let translatedNodes = new Set();
 let isRTL = false;
 let isAutoTranslatingEnabled = false;
 let observerSettings = null; // Added for storing settings for the observer
+let activeTranslationUIs = 0; // Counter for active translation UI elements
 
 // RTL languages list
 const RTL_LANGUAGES = ['ar', 'he', 'fa', 'ur', 'yi', 'dv', 'ps'];
 
 // Create and inject our styles only when needed
 function injectStyles() {
+  // console.log("Injecting styles");
   if (!injectedStyles) {
     injectedStyles = document.createElement('style');
     injectedStyles.textContent = `
@@ -124,9 +126,32 @@ function injectStyles() {
 
 // Remove injected styles
 function removeStyles() {
+  // console.log("Removing styles");
   if (injectedStyles) {
     injectedStyles.remove();
     injectedStyles = null;
+  }
+}
+
+// Request styles: Call this when a UI element that needs styles is created
+function requestStyles() {
+  if (activeTranslationUIs === 0) {
+    injectStyles();
+  }
+  activeTranslationUIs++;
+  // console.log("Styles requested, active UIs:", activeTranslationUIs);
+}
+
+// Release styles: Call this when a UI element that needs styles is destroyed
+function releaseStyles() {
+  activeTranslationUIs--;
+  // console.log("Styles released, active UIs:", activeTranslationUIs);
+  if (activeTranslationUIs === 0) {
+    removeStyles();
+  }
+  if (activeTranslationUIs < 0) { // Safety check
+    activeTranslationUIs = 0;
+    // console.warn("activeTranslationUIs fell below zero, reset to 0");
   }
 }
 
@@ -162,7 +187,10 @@ function createTranslationPopup(text, x, y, settings) {
   const closeButton = document.createElement('span');
   closeButton.className = 'close';
   closeButton.textContent = '×';
-  closeButton.onclick = () => popup.remove();
+  closeButton.onclick = () => {
+    popup.remove();
+    releaseStyles(); // Release styles when popup is closed
+  };
 
   const content = document.createElement('div');
   content.className = 'content';
@@ -219,10 +247,13 @@ function cleanupTranslation() {
   if (translationOverlay) {
     translationOverlay.remove();
     translationOverlay = null;
+    // This overlay was using styles, so release them.
+    // This is typically for the main manual selection overlay.
+    releaseStyles();
   }
-  removeStyles();
-  originalStyles.clear();
-  translatedNodes.clear();
+  // removeStyles(); // Direct call removed, handled by releaseStyles()
+  originalStyles.clear(); // This seems fine to keep for a full cleanup
+  translatedNodes.clear(); // This also seems fine for a full cleanup of page translation context
 }
 
 // Apply RTL styles to element
@@ -329,7 +360,8 @@ async function translateSelection(settings) {
     return;
   }
 
-  injectStyles();
+  requestStyles(); // Request styles for the translation UI
+  // injectStyles(); // Old direct call
   const range = selection.getRangeAt(0);
   const rect = range.getBoundingClientRect();
 
@@ -391,7 +423,8 @@ async function translatePage(settings) {
   isTranslating = true;
 
   isRTL = RTL_LANGUAGES.includes(settings.targetLang);
-  injectStyles();
+  requestStyles(); // Request styles for the page translation UI
+  // injectStyles(); // Old direct call
   
   const textNodes = [];
   const walk = document.createTreeWalker(
@@ -454,16 +487,27 @@ async function translatePage(settings) {
       : 'Translation completed successfully!';
     overlay.innerHTML = `<div class="translation-complete">${message}</div>`;
     setTimeout(() => {
-      cleanupTranslation();
+      // cleanupTranslation(); // cleanupTranslation might be too broad if it also clears styles
+      if (overlay.parentNode) overlay.remove(); // Just remove the message overlay
+      releaseStyles(); // Release styles after message timeout
     }, 2000);
   } catch (error) {
     console.error('Translation failed:', error);
-    overlay.innerHTML = `
+    // Ensure overlay exists before trying to set its innerHTML or remove it
+    const errorOverlay = createTranslationOverlay(); // This ensures overlay is not null if error occurs early
+    errorOverlay.innerHTML = `
       <div class="translation-error">
         ${error.message}
       </div>`;
+    errorOverlay.style.display = 'block'; // Ensure it's visible
+    setTimeout(() => {
+      if (errorOverlay.parentNode) errorOverlay.remove();
+      releaseStyles(); // Release styles after error message timeout
+    }, 3000); // Longer timeout for errors
   } finally {
     isTranslating = false;
+    // Note: If an error occurs very early, 'overlay' might be the original loading one,
+    // or 'errorOverlay' if created in catch. The logic ensures we try to remove what was shown.
   }
 }
 
@@ -579,20 +623,46 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // Close translation overlay when clicking outside
 document.addEventListener('click', (event) => {
-  if (translationOverlay && !event.target.closest('.translation-popup') && !event.target.closest('.auto-translation-popup')) {
-    cleanupTranslation();
-    // Also remove any auto-translation popups if click is outside
-    const autoPopups = document.querySelectorAll('.auto-translation-popup');
-    autoPopups.forEach(p => p.remove());
+  // Handle auto-translation popups: close if click is outside
+  document.querySelectorAll('.auto-translation-popup').forEach(popupInstance => {
+    if (!popupInstance.contains(event.target)) {
+      // Check if the click is on the scrollbar of the popup, ignore if so
+      if (event.clientX >= popupInstance.offsetLeft && event.clientX <= popupInstance.offsetLeft + popupInstance.offsetWidth &&
+          event.clientY >= popupInstance.offsetTop && event.clientY <= popupInstance.offsetTop + popupInstance.offsetHeight) {
+          // Click might be on scrollbar, check if it's truly outside content bounds if necessary
+          // For simplicity, if contains is false, we assume it's outside.
+      } else {
+        popupInstance.remove();
+        releaseStyles(); // Release styles for the closed auto-popup
+      }
+    }
+  });
+
+  // Handle manual translation overlay (which contains a .translation-popup)
+  if (translationOverlay && translationOverlay.style.display !== 'none') {
+    const popupInOverlay = translationOverlay.querySelector('.translation-popup');
+
+    // If the click is outside the popup content area within the overlay,
+    // or if there's no specific popup (e.g. only loading/error message) and click is outside that message.
+    if (popupInOverlay && !popupInOverlay.contains(event.target)) {
+        // Click is outside the actual popup content but could be on the overlay itself.
+        // We want to close only if the click is truly outside the modal content.
+        cleanupTranslation(); // cleanupTranslation will call releaseStyles
+    } else if (!popupInOverlay && !event.target.closest('.translation-loading') && !event.target.closest('.translation-error') && !event.target.closest('.translation-complete')) {
+        // If no popup, but there's an overlay (e.g. page translation loading/error), and click is outside these messages
+        cleanupTranslation(); // cleanupTranslation will call releaseStyles
+    }
   }
 });
 
 // Function to create and show the auto-translation popup
 async function showAutoTranslationPopup(selectedText, settings, x, y) {
-  // Ensure styles are injected
-  injectStyles();
+  requestStyles(); // Request styles for the auto-translation popup
+  // injectStyles(); // Old direct call
 
   // Remove any existing auto-translation popups
+  // If an old auto popup is removed, it should have released its styles.
+  // This new one will request styles.
   const existingPopups = document.querySelectorAll('.auto-translation-popup');
   existingPopups.forEach(p => p.remove());
 
@@ -606,7 +676,10 @@ async function showAutoTranslationPopup(selectedText, settings, x, y) {
   const closeButton = document.createElement('span');
   closeButton.className = 'close';
   closeButton.textContent = '×';
-  closeButton.onclick = () => popup.remove();
+  closeButton.onclick = () => {
+    popup.remove();
+    releaseStyles(); // Release styles when auto-popup is closed
+  };
 
   const content = document.createElement('div');
   content.className = 'content';
