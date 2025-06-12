@@ -4,6 +4,8 @@ let originalStyles = new Map();
 let injectedStyles = null;
 let translatedNodes = new Set();
 let isRTL = false;
+let isAutoTranslatingEnabled = false;
+let observerSettings = null; // Added for storing settings for the observer
 
 // RTL languages list
 const RTL_LANGUAGES = ['ar', 'he', 'fa', 'ur', 'yi', 'dv', 'ps'];
@@ -151,7 +153,7 @@ function createLoadingIndicator() {
 }
 
 // Create translation popup
-function createTranslationPopup(text, x, y) {
+function createTranslationPopup(text, x, y, settings) {
   const popup = document.createElement('div');
   popup.className = 'translation-popup';
   popup.style.left = `${x}px`;
@@ -165,7 +167,9 @@ function createTranslationPopup(text, x, y) {
   const content = document.createElement('div');
   content.className = 'content';
   content.textContent = text;
-  if (isRTL) {
+
+  // Determine RTL based on current settings for this specific popup
+  if (settings && RTL_LANGUAGES.includes(settings.targetLang)) {
     content.style.direction = 'rtl';
     content.style.textAlign = 'right';
   }
@@ -222,11 +226,18 @@ function cleanupTranslation() {
 }
 
 // Apply RTL styles to element
-function applyRTLStyles(element) {
-  if (isRTL) {
+// Takes a boolean isLanguageRTL to determine if RTL styles should be applied.
+function applyRTLStyles(element, isLanguageRTL) {
+  if (isLanguageRTL) {
     element.setAttribute('data-translated', 'true');
-    element.style.direction = 'rtl';
-    element.style.textAlign = 'right';
+    // Ensure existing styles are not overwritten if they are more specific
+    // by checking before setting.
+    if (element.style.direction !== 'rtl') {
+      element.style.direction = 'rtl';
+    }
+    if (element.style.textAlign !== 'right') {
+      element.style.textAlign = 'right';
+    }
   }
 }
 
@@ -263,24 +274,46 @@ async function translateText(text, settings, retryCount = 3) {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+        let specificMessage = errorData.error || `HTTP error! Status: ${response.status}`;
+        if (response.status === 401) {
+          specificMessage = "Authentication failed. Please check your API key if you're using one, and ensure your API URL is correct.";
+        } else if (response.status === 403) {
+          specificMessage = "Forbidden. You may not have permission to access this LibreTranslate instance or the API key is invalid/required.";
+        } else if (response.status === 400) {
+          specificMessage = "Invalid request. This might be due to an unsupported language code or invalid input text. Please check your settings and selection.";
+        } else if (response.status === 429) {
+          specificMessage = "Too many requests. Please try again later.";
+        } else if (response.status === 500) {
+          specificMessage = `LibreTranslate server error (Status: ${response.status}). Please try again later or check the server status.`;
+        } else if (response.status > 500) { // Catch-all for other 5xx errors
+          specificMessage = `LibreTranslate server error (Status: ${response.status}). Please try again later.`;
+        }
+        throw new Error(specificMessage);
       }
 
       const data = await response.json();
       if (!data.translatedText) {
-        throw new Error('Invalid response from translation service');
+        // This case might occur if the API returns 200 OK but an empty/invalid JSON structure for translatedText
+        throw new Error('Invalid response from translation service: No translated text found.');
       }
 
       console.log('Translation successful:', data.translatedText);
       return data.translatedText;
     } catch (error) {
-      console.error(`Translation attempt ${attempt} failed:`, error);
+      console.error(`Translation attempt ${attempt} failed:`, error.message); // Log only message for brevity
       
       if (attempt === retryCount) {
-        throw new Error(`Translation failed after ${retryCount} attempts: ${error.message}`);
+        let detailedError = error.message;
+        if (error.message.toLowerCase().includes('failed to fetch')) {
+            detailedError = `Network error: Could not connect to the LibreTranslate server (${settings.apiUrl || 'URL not set'}). Please check your internet connection and the API URL in settings.`;
+        } else if (error.message.includes('API URL is not configured')) {
+            detailedError = "API URL is not configured. Please set it in the extension settings.";
+        }
+        // For other errors, error.message should already be specific from the block above.
+        throw new Error(detailedError);
       }
       
-      await delay(Math.min(1000 * Math.pow(2, attempt - 1), 5000));
+      await delay(Math.min(1000 * Math.pow(2, attempt - 1), 5000)); // Backoff delay
     }
   }
 }
@@ -312,7 +345,8 @@ async function translateSelection(settings) {
     const popup = createTranslationPopup(
       translatedText,
       rect.left + window.scrollX,
-      rect.bottom + window.scrollY + 10
+      rect.bottom + window.scrollY + 10,
+      settings // Pass settings to createTranslationPopup
     );
     overlay.appendChild(popup);
   } catch (error) {
@@ -320,8 +354,7 @@ async function translateSelection(settings) {
     const overlay = createTranslationOverlay();
     overlay.innerHTML = `
       <div class="translation-error">
-        Translation failed: ${error.message}<br>
-        Please check your API URL and try again.
+        ${error.message}
       </div>`;
     overlay.style.display = 'block';
   } finally {
@@ -342,7 +375,10 @@ async function translateNode(node, settings) {
     
     const parent = node.parentElement;
     if (parent) {
-      applyRTLStyles(parent);
+      const currentIsRTL = RTL_LANGUAGES.includes(settings.targetLang);
+      if (currentIsRTL) {
+        applyRTLStyles(parent, true);
+      }
     }
   } catch (error) {
     console.error('Translation failed for node:', error);
@@ -406,7 +442,7 @@ async function translatePage(settings) {
         const progress = Math.round((processedNodes / totalNodes) * 100);
         const progressText = overlay.querySelector('.loading-progress');
         if (progressText) {
-          progressText.textContent = `${progress}% (${failedNodes} failed)`;
+          progressText.textContent = `(${processedNodes}/${totalNodes}) ${progress}% (${failedNodes} failed)`;
         }
       }));
 
@@ -424,8 +460,7 @@ async function translatePage(settings) {
     console.error('Translation failed:', error);
     overlay.innerHTML = `
       <div class="translation-error">
-        Translation failed: ${error.message}<br>
-        Please check your API URL and try again.
+        ${error.message}
       </div>`;
   } finally {
     isTranslating = false;
@@ -436,41 +471,100 @@ async function translatePage(settings) {
 let observer = null;
 
 function setupObserver(settings) {
+  observerSettings = settings; // Store settings for the observer callback
   if (observer) {
     observer.disconnect();
   }
 
   observer = new MutationObserver((mutations) => {
+    if (!observerSettings) {
+      console.warn("Observer callback running without settings, skipping translation.");
+      return;
+    }
     mutations.forEach((mutation) => {
       if (mutation.type === 'childList') {
         mutation.addedNodes.forEach((node) => {
-          if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
-            translateNode(node, settings);
+          if (node.nodeType === Node.TEXT_NODE && node.textContent.trim() && !translatedNodes.has(node)) {
+            if (node.parentElement && !node.parentElement.closest('script') && !node.parentElement.closest('style')) {
+              translateNode(node, observerSettings);
+            }
           } else if (node.nodeType === Node.ELEMENT_NODE) {
+            // Avoid processing elements if they themselves or their parents are already marked as translated (e.g. by RTL styles)
+            if (node.closest('[data-translated="true"]')) return;
+
             const walk = document.createTreeWalker(
               node,
               NodeFilter.SHOW_TEXT,
               null,
               false
             );
-
             let textNode;
             while (textNode = walk.nextNode()) {
-              if (textNode.textContent.trim()) {
-                translateNode(textNode, settings);
+              if (textNode.textContent.trim() && !translatedNodes.has(textNode)) {
+                 if (textNode.parentElement && !textNode.parentElement.closest('script') && !textNode.parentElement.closest('style')) {
+                  translateNode(textNode, observerSettings);
+                }
               }
             }
           }
         });
+      } else if (mutation.type === 'attributes') {
+        if (mutation.target.nodeType === Node.ELEMENT_NODE) {
+          // Avoid re-translating an element that caused the mutation if it's already processed or part of a translated tree.
+          // However, its children might have changed or become visible.
+          // if (translatedNodes.has(mutation.target) || mutation.target.closest('[data-translated="true"]')) return;
+
+          const style = window.getComputedStyle(mutation.target);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+            return; // Don't process children of hidden elements
+          }
+
+          // If an attribute change made a container visible, check its text node children
+          const walk = document.createTreeWalker(
+            mutation.target,
+            NodeFilter.SHOW_TEXT,
+            null,
+            false
+          );
+          let textNode;
+          while (textNode = walk.nextNode()) {
+            if (textNode.textContent.trim() && !translatedNodes.has(textNode)) {
+              if (textNode.parentElement &&
+                  !textNode.parentElement.closest('script') &&
+                  !textNode.parentElement.closest('style') &&
+                  !textNode.parentElement.closest('[data-translated="true"]')) { // Don't re-translate if parent is already done
+                translateNode(textNode, observerSettings);
+              }
+            }
+          }
+        }
       }
     });
   });
 
   observer.observe(document.body, {
     childList: true,
-    subtree: true
+    subtree: true,
+    attributes: true,
+    // attributeFilter: ['class', 'style'] // Consider if performance is an issue
   });
 }
+
+// Load initial autoTranslate setting
+chrome.storage.sync.get('autoTranslate', (items) => {
+  if (items.autoTranslate) {
+    isAutoTranslatingEnabled = true;
+    console.log('Auto-translation enabled on load');
+  }
+});
+
+// Listen for changes in settings
+chrome.storage.onChanged.addListener((changes, namespace) => {
+  if (namespace === 'sync' && changes.autoTranslate) {
+    isAutoTranslatingEnabled = changes.autoTranslate.newValue;
+    console.log('Auto-translation setting changed to:', isAutoTranslatingEnabled);
+  }
+});
 
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -485,7 +579,106 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // Close translation overlay when clicking outside
 document.addEventListener('click', (event) => {
-  if (translationOverlay && !event.target.closest('.translation-popup')) {
+  if (translationOverlay && !event.target.closest('.translation-popup') && !event.target.closest('.auto-translation-popup')) {
     cleanupTranslation();
+    // Also remove any auto-translation popups if click is outside
+    const autoPopups = document.querySelectorAll('.auto-translation-popup');
+    autoPopups.forEach(p => p.remove());
+  }
+});
+
+// Function to create and show the auto-translation popup
+async function showAutoTranslationPopup(selectedText, settings, x, y) {
+  // Ensure styles are injected
+  injectStyles();
+
+  // Remove any existing auto-translation popups
+  const existingPopups = document.querySelectorAll('.auto-translation-popup');
+  existingPopups.forEach(p => p.remove());
+
+  const popup = document.createElement('div');
+  popup.className = 'translation-popup auto-translation-popup'; // Added new class for specific styling/selection
+  popup.style.position = 'absolute'; // Use absolute for positioning near text
+  popup.style.left = `${x}px`;
+  popup.style.top = `${y}px`;
+  // Potentially add a max-width or other styles to differentiate from the main popup
+
+  const closeButton = document.createElement('span');
+  closeButton.className = 'close';
+  closeButton.textContent = '×';
+  closeButton.onclick = () => popup.remove();
+
+  const content = document.createElement('div');
+  content.className = 'content';
+  content.textContent = 'Translating...'; // Initial text
+
+  popup.appendChild(closeButton);
+  popup.appendChild(content);
+  document.body.appendChild(popup); // Append to body, not overlay
+
+  try {
+    const translatedText = await translateText(selectedText, settings);
+    content.textContent = translatedText;
+    if (RTL_LANGUAGES.includes(settings.targetLang)) {
+      content.style.direction = 'rtl';
+      content.style.textAlign = 'right';
+    }
+  } catch (error) {
+    console.error('Auto-translation failed:', error);
+    content.textContent = error.message; // Display the more specific error message directly
+    // Optionally auto-remove error popups after a delay
+    setTimeout(() => popup.remove(), 5000);
+  }
+}
+
+// Event listener for mouseup to trigger auto-translation
+document.addEventListener('mouseup', async (event) => {
+  if (isAutoTranslatingEnabled) {
+    const selection = window.getSelection();
+    const selectedText = selection.toString().trim();
+
+    if (selectedText) {
+      // Avoid triggering if interacting with an existing popup
+      if (event.target.closest('.translation-popup') || event.target.closest('.auto-translation-popup')) {
+        return;
+      }
+
+      console.log('Auto-translating selected text:', selectedText);
+      // Get settings
+      chrome.storage.sync.get(['targetLang', 'apiUrl', 'apiKey'], (settings) => {
+        if (!settings.apiUrl) {
+          console.warn('API URL not set, cannot auto-translate.');
+          // Optionally, inform the user via a small, temporary message near selection
+          return;
+        }
+        const currentSettings = {
+          targetLang: settings.targetLang || 'en',
+          apiUrl: settings.apiUrl,
+          apiKey: settings.apiKey || ''
+        };
+
+        const range = selection.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+
+        // Position the popup below the selection
+        // Adjustments might be needed for better positioning
+        let popupX = rect.left + window.scrollX;
+        let popupY = rect.bottom + window.scrollY + 5; // 5px below selection
+
+        // Basic boundary checks (so it doesn't go off-screen)
+        // A more robust solution would involve checking popup dimensions once rendered
+        if (popupX + 300 > window.innerWidth) { // Assuming max-width of 300px
+            popupX = window.innerWidth - 300 - 10; // Adjust with some padding
+        }
+        if (popupY + 100 > window.innerHeight) { // Assuming approx height
+            popupY = rect.top + window.scrollY - 100 - 5; // Position above if no space below
+        }
+        popupX = Math.max(0, popupX); // Ensure not off-screen left
+        popupY = Math.max(0, popupY); // Ensure not off-screen top
+
+
+        showAutoTranslationPopup(selectedText, currentSettings, popupX, popupY);
+      });
+    }
   }
 }); 
