@@ -1,15 +1,17 @@
 document.addEventListener('DOMContentLoaded', function() {
   // Load saved settings
-  chrome.storage.sync.get(['targetLang', 'apiUrl', 'apiKey'], function(items) {
+  chrome.storage.sync.get(['targetLang', 'apiUrl', 'apiKey', 'autoTranslate'], function(items) {
     if (items.targetLang) document.getElementById('targetLang').value = items.targetLang;
     if (items.apiUrl) document.getElementById('apiUrl').value = items.apiUrl;
     if (items.apiKey) document.getElementById('apiKey').value = items.apiKey;
+    if (items.autoTranslate) document.getElementById('autoTranslate').checked = items.autoTranslate;
   });
 
   // Save settings when changed
   document.getElementById('targetLang').addEventListener('change', saveSettings);
   document.getElementById('apiUrl').addEventListener('change', saveSettings);
   document.getElementById('apiKey').addEventListener('change', saveSettings);
+  document.getElementById('autoTranslate').addEventListener('change', saveSettings);
 
   // Translate page button
   document.getElementById('translatePage').addEventListener('click', function() {
@@ -45,7 +47,8 @@ function getSettings() {
   return {
     targetLang: document.getElementById('targetLang').value,
     apiUrl: document.getElementById('apiUrl').value,
-    apiKey: document.getElementById('apiKey').value
+    apiKey: document.getElementById('apiKey').value,
+    autoTranslate: document.getElementById('autoTranslate').checked
   };
 }
 
